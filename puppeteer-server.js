@@ -4,12 +4,43 @@ const { Pool } = require('pg');
 const bodyParser = require('body-parser');
 const path = require('path');
 const fs = require('fs');
+const pLimit = require('p-limit');
 
 const app = express();
 const PORT = 4000;
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+
+// Variables Globales
+let globalBrowser = null;
+
+// Configurar la cola de concurrencia a 5 workers
+const limit = pLimit(5);
+
+// Inicializar Puppeteer Global
+async function initBrowser() {
+  try {
+    console.log('Inicializando instancia global de Chromium...');
+    globalBrowser = await puppeteer.launch({
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--disable-gpu',
+        '--lang=es-MX'
+      ]
+    });
+    console.log('Instancia global de Chromium inicializada con éxito.');
+  } catch (error) {
+    console.error('Error al inicializar la instancia global de Chromium:', error);
+    process.exit(1);
+  }
+}
+initBrowser();
 
 // Configuración de DB
 const pool = new Pool({
@@ -93,161 +124,165 @@ app.post('/orders/:id/generate', async (req, res) => {
     return res.status(400).send('URL is required');
   }
 
-  // Verificar si la orden existe
-  let clientName = null;
+  // Encolar la petición de Puppeteer con p-limit para prevenir saturación de memoria
   try {
-    const orderCheck = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
-    if (orderCheck.rows.length === 0) {
-      return res.status(404).send('Order not found');
-    }
-    clientName = orderCheck.rows[0].client_full_name;
-  } catch (err) {
-    return res.status(500).send('Database error');
-  }
-
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu',
-        '--lang=es-MX'
-      ]
-    });
-    const page = await browser.newPage();
-
-    // Configurar Viewport
-    await page.setViewport({ width: 1200, height: 800 });
-
-    // Headers HTTP
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'es-MX,es-419;q=0.9,es;q=0.8,en-US;q=0.7'
-    });
-
-    // Override JS Navigator Language
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'language', { get: () => 'es-MX' });
-      Object.defineProperty(navigator, 'languages', { get: () => ['es-MX', 'es-419', 'es', 'en-US', 'en'] });
-    });
-
-    // Force locale=es-MX on URL
-    let finalUrl = url;
+    await limit(async () => {
+      // Verificar si la orden existe
+    let clientName = null;
     try {
-      const parsedUrl = new URL(finalUrl);
-      parsedUrl.searchParams.set('locale', 'es-MX');
-      finalUrl = parsedUrl.toString();
-    } catch (e) {
-      console.error('Invalid URL format:', e);
+      const orderCheck = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+      if (orderCheck.rows.length === 0) {
+        return res.status(404).send('Order not found');
+      }
+      clientName = orderCheck.rows[0].client_full_name;
+    } catch (err) {
+      return res.status(500).send('Database error');
     }
 
-    console.log(`[Order ${id}] Navigating to:`, finalUrl);
-    await page.goto(finalUrl, { waitUntil: 'networkidle0' });
+    let context = null;
+    let page = null;
+    try {
+      if (!globalBrowser) throw new Error('Global browser not initialized');
+      // Usar Contexto Incógnito para aislamiento total entre cada voucher
+      context = await globalBrowser.createIncognitoBrowserContext();
+      page = await context.newPage();
 
-    // Inyectar Nombre del Cliente en el DOM y obtener coordenadas del Voucher
-    let clipRect = null;
-    console.log(`[Order ${id}] ClientName retrieved:`, clientName);
-    if (clientName) {
-      clipRect = await page.evaluate((name) => {
-        // Encontrar contenedor de instrucciones (independiente del idioma)
-        let target = document.querySelector('.loc_instructionsToPay') || document.querySelector('.OXXO-instructions');
+      // Configurar Viewport
+      await page.setViewport({ width: 1200, height: 800 });
 
-        // Agregar el nombre si encontramos donde
-        if (target && target.parentNode) {
-          const div = document.createElement('div');
-          div.textContent = name;
-          div.style.textAlign = 'center';
-          div.style.fontSize = '18px';
-          div.style.fontWeight = 'bold';
-          div.style.color = '#333';
-          div.style.fontFamily = 'Helvetica, Arial, sans-serif';
-          div.style.margin = '15px 0';
-          div.style.padding = '0';
-          div.style.width = '100%';
-          target.parentNode.insertBefore(div, target);
-        } else {
-          // Fallback
-          const fallbackDiv = document.createElement('div');
-          fallbackDiv.style.position = 'absolute';
-          fallbackDiv.style.top = '10px';
-          fallbackDiv.style.left = '0';
-          fallbackDiv.style.width = '100%';
-          fallbackDiv.style.textAlign = 'center';
-          fallbackDiv.style.fontWeight = 'bold';
-          fallbackDiv.style.fontSize = '18px';
-          fallbackDiv.textContent = name;
-          document.body.appendChild(fallbackDiv);
-        }
+      // Headers HTTP
+      await page.setExtraHTTPHeaders({
+        'Accept-Language': 'es-MX,es-419;q=0.9,es;q=0.8,en-US;q=0.7'
+      });
 
-        // Ocultar el botón de Imprimir ya que es solo una imagen para WhatsApp
-        const printBtn = document.querySelector('.HostedVoucherButton');
-        if (printBtn) printBtn.style.display = 'none';
+      // Override JS Navigator Language
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'language', { get: () => 'es-MX' });
+        Object.defineProperty(navigator, 'languages', { get: () => ['es-MX', 'es-419', 'es', 'en-US', 'en'] });
+      });
 
-        // Obtener la caja delimitadora del contenedor principal ancho que incluye "SIIP INTERNET" y sombra
-        const targetArea = document.querySelector('.Chrome .flex-container.spacing-16.direction-column')
-          || document.querySelector('.ContentCard')
-          || document.querySelector('.Voucher');
+      // Force locale=es-MX on URL
+      let finalUrl = url;
+      try {
+        const parsedUrl = new URL(finalUrl);
+        parsedUrl.searchParams.set('locale', 'es-MX');
+        finalUrl = parsedUrl.toString();
+      } catch (e) {
+        console.error('Invalid URL format:', e);
+      }
 
-        if (targetArea) {
-          const { x, y, width, height } = targetArea.getBoundingClientRect();
-          // Agregar padding para dar respiro al recorte y emular el padding del margen blanco
-          const padding = 20;
-          return {
-            x: Math.max(0, x - padding),
-            y: Math.max(0, y - padding),
-            width: width + (padding * 2),
-            height: height + (padding * 2)
-          };
-        }
-        return null; // Si no se encuentra, retornará null
-      }, clientName);
+      console.log(`[Order ${id}] Navigating to:`, finalUrl);
+      await page.goto(finalUrl, { waitUntil: 'networkidle0' });
+
+      // Inyectar Nombre del Cliente en el DOM y obtener coordenadas del Voucher
+      let clipRect = null;
+      console.log(`[Order ${id}] ClientName retrieved:`, clientName);
+      if (clientName) {
+        clipRect = await page.evaluate((name) => {
+          // Encontrar contenedor de instrucciones (independiente del idioma)
+          let target = document.querySelector('.loc_instructionsToPay') || document.querySelector('.OXXO-instructions');
+
+          // Agregar el nombre si encontramos donde
+          if (target && target.parentNode) {
+            const div = document.createElement('div');
+            div.textContent = name;
+            div.style.textAlign = 'center';
+            div.style.fontSize = '18px';
+            div.style.fontWeight = 'bold';
+            div.style.color = '#333';
+            div.style.fontFamily = 'Helvetica, Arial, sans-serif';
+            div.style.margin = '15px 0';
+            div.style.padding = '0';
+            div.style.width = '100%';
+            target.parentNode.insertBefore(div, target);
+          } else {
+            // Fallback
+            const fallbackDiv = document.createElement('div');
+            fallbackDiv.style.position = 'absolute';
+            fallbackDiv.style.top = '10px';
+            fallbackDiv.style.left = '0';
+            fallbackDiv.style.width = '100%';
+            fallbackDiv.style.textAlign = 'center';
+            fallbackDiv.style.fontWeight = 'bold';
+            fallbackDiv.style.fontSize = '18px';
+            fallbackDiv.textContent = name;
+            document.body.appendChild(fallbackDiv);
+          }
+
+          // Ocultar el botón de Imprimir ya que es solo una imagen para WhatsApp
+          const printBtn = document.querySelector('.HostedVoucherButton');
+          if (printBtn) printBtn.style.display = 'none';
+
+          // Obtener la caja delimitadora del contenedor principal ancho que incluye "SIIP INTERNET" y sombra
+          const targetArea = document.querySelector('.Chrome .flex-container.spacing-16.direction-column')
+            || document.querySelector('.ContentCard')
+            || document.querySelector('.Voucher');
+
+          if (targetArea) {
+            const { x, y, width, height } = targetArea.getBoundingClientRect();
+            // Agregar padding para dar respiro al recorte y emular el padding del margen blanco
+            const padding = 20;
+            return {
+              x: Math.max(0, x - padding),
+              y: Math.max(0, y - padding),
+              width: width + (padding * 2),
+              height: height + (padding * 2)
+            };
+          }
+          return null; // Si no se encuentra, retornará null
+        }, clientName);
+      }
+      console.log(`[Order ${id}] Extracted clipRect from DOM:`, clipRect);
+
+      // Screenshot
+      const screenshotOptions = {};
+      if (clipRect) {
+        screenshotOptions.clip = clipRect;
+      } else if (req.body.clip) {
+        screenshotOptions.clip = req.body.clip;
+      }
+      console.log(`[Order ${id}] Screenshot options:`, screenshotOptions);
+      const screenshotBuffer = await page.screenshot(screenshotOptions);
+      console.log(`[Order ${id}] Screenshot generated, size:`, screenshotBuffer.length);
+
+      // Actualizar DB
+      await pool.query(
+        `UPDATE orders 
+         SET status = 'completed', 
+             voucher_filename = $1, 
+             updated_at = CURRENT_TIMESTAMP 
+         WHERE id = $2`,
+        [filename, id]
+      );
+
+      // Enviar imagen
+      res.writeHead(200, {
+        'Content-Type': 'image/jpeg',
+        'Content-Length': screenshotBuffer.length
+      });
+      res.end(screenshotBuffer);
+
+    } catch (error) {
+      console.error('Error generating voucher:', error);
+
+      // Marcar como error en DB
+      await pool.query("UPDATE orders SET status = 'failed' WHERE id = $1", [id]);
+      if (!res.headersSent) {
+        res.status(500).send('Error generating voucher image');
+      }
+    } finally {
+      // Garantizar la liberación segura de recursos independientemente del éxito o del error
+      if (page) {
+        await page.close().catch(e => console.error('Error closing page:', e));
+      }
+      if (context) {
+        await context.close().catch(e => console.error('Error closing context:', e));
+      }
     }
-    console.log(`[Order ${id}] Extracted clipRect from DOM:`, clipRect);
-
-    // Screenshot
-    const screenshotOptions = {};
-    if (clipRect) {
-      screenshotOptions.clip = clipRect;
-    } else if (req.body.clip) {
-      screenshotOptions.clip = req.body.clip;
-    }
-    console.log(`[Order ${id}] Screenshot options:`, screenshotOptions);
-    const screenshotBuffer = await page.screenshot(screenshotOptions);
-    console.log(`[Order ${id}] Screenshot generated, size:`, screenshotBuffer.length);
-    await browser.close();
-
-    // Actualizar DB
-    await pool.query(
-      `UPDATE orders 
-       SET status = 'completed', 
-           voucher_filename = $1, 
-           updated_at = CURRENT_TIMESTAMP 
-       WHERE id = $2`,
-      [filename, id]
-    );
-
-    // Enviar imagen
-    res.writeHead(200, {
-      'Content-Type': 'image/jpeg',
-      'Content-Length': screenshotBuffer.length
-    });
-    res.end(screenshotBuffer);
-
-
-  } catch (error) {
-    console.error('Error generating voucher:', error);
-    if (browser) await browser.close();
-
-    // Marcar como error en DB
-    await pool.query("UPDATE orders SET status = 'failed' WHERE id = $1", [id]);
-
-    res.status(500).send('Error generating voucher image');
+    }); // fin de limit block
+  } catch (err) {
+    console.error('Limit block processing error:', err);
+    if (!res.headersSent) res.status(500).send('Service overloaded');
   }
 });
 
@@ -291,28 +326,51 @@ app.get('/screenshot', async (req, res) => {
   if (!url) return res.status(400).send('URL is required');
 
   try {
-    const browser = await puppeteer.launch({
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--lang=es-MX']
-    });
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'es-MX,es;q=0.9'
-    });
-    let finalUrl = url;
-    try {
-      const parsedUrl = new URL(finalUrl);
-      parsedUrl.searchParams.set('locale', 'es-MX');
-      finalUrl = parsedUrl.toString();
-    } catch (e) { }
-    await page.goto(finalUrl);
-    const buffer = await page.screenshot();
-    await browser.close();
+    await limit(async () => {
+      let context = null;
+      let page = null;
+      try {
+        console.log('[Screenshot] Checking globalBrowser initialized...');
+        if (!globalBrowser) throw new Error('Global browser not initialized');
+        console.log('[Screenshot] globalBrowser is initialized. Creating context...');
+        context = await globalBrowser.createIncognitoBrowserContext();
+        console.log('[Screenshot] Context created. Launching new page...');
+        page = await context.newPage();
+        
+        await page.setExtraHTTPHeaders({
+          'Accept-Language': 'es-MX,es;q=0.9'
+        });
+        
+        let finalUrl = url;
+        try {
+          const parsedUrl = new URL(finalUrl);
+          parsedUrl.searchParams.set('locale', 'es-MX');
+          finalUrl = parsedUrl.toString();
+        } catch (e) { }
+        
+        console.log('[Screenshot] Navigating to:', finalUrl);
+        await page.goto(finalUrl);
+        console.log('[Screenshot] Navigation complete. Taking screenshot...');
+        const buffer = await page.screenshot();
+        console.log('[Screenshot] Screenshot successful, sending response.');
 
-    res.writeHead(200, { 'Content-Type': 'image/png' });
-    res.end(buffer);
-  } catch (e) {
-    res.status(500).send(e.toString());
+        res.writeHead(200, { 'Content-Type': 'image/png' });
+        res.end(buffer);
+      } catch (e) {
+        console.error('[Screenshot] Error inside limit block:', e);
+        if (!res.headersSent) res.status(500).send(e.toString());
+      } finally {
+        if (page) {
+          await page.close().catch(e => console.error('Error closing legacy page:', e));
+        }
+        if (context) {
+          await context.close().catch(e => console.error('Error closing legacy context:', e));
+        }
+      }
+    }); // fin de limit block
+  } catch (err) {
+    console.error('Legacy screenshot limit block error:', err);
+    if (!res.headersSent) res.status(500).send(`Service overloaded: ${err.message}`);
   }
 });
 
@@ -397,6 +455,19 @@ app.get('/custom-attributes/:id/options', async (req, res) => {
     console.error('Error fetching attribute options:', err);
     res.status(500).json({ error: 'Database error' });
   }
+});
+
+// Cleanup process handling
+process.on('SIGINT', async () => {
+  console.log('Cerrando Puppeteer y saliendo...');
+  if (globalBrowser) await globalBrowser.close();
+  process.exit();
+});
+
+process.on('SIGTERM', async () => {
+  console.log('Cerrando Puppeteer y saliendo...');
+  if (globalBrowser) await globalBrowser.close();
+  process.exit();
 });
 
 app.listen(PORT, '0.0.0.0', () => {
