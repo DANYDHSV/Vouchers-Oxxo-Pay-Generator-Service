@@ -1,0 +1,15 @@
+{
+    "name": "oxxo-voucher-service",
+    "version": "1.0.0",
+    "description": "Service to generate OXXO payment vouchers and manage asynchronous orders",
+    "main": "puppeteer-server.js",
+    "scripts": {
+        "start": "node puppeteer-server.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "puppeteer": "^19.0.0",
+        "pg": "^8.11.0",
+        "body-parser": "^1.20.2"
+    }
+}
