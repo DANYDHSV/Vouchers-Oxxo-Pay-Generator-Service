@@ -14,6 +14,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // Variables Globales
 let globalBrowser = null;
+let browserRestartScheduled = false;
 
 // Configurar la cola de concurrencia a 5 workers
 const limit = pLimit(5);
@@ -36,6 +37,21 @@ async function initBrowser() {
       ]
     });
     console.log('Instancia global de Chromium inicializada con éxito.');
+    globalBrowser.on('disconnected', () => {
+      if (browserRestartScheduled) return;
+
+      browserRestartScheduled = true;
+      globalBrowser = null;
+      console.error('Chromium se desconectó inesperadamente. Reiniciando en 2s...');
+      setTimeout(async () => {
+        browserRestartScheduled = false;
+        try {
+          await initBrowser();
+        } catch (restartError) {
+          console.error('Error al reiniciar Chromium:', restartError);
+        }
+      }, 2000);
+    });
   } catch (error) {
     console.error('Error al inicializar la instancia global de Chromium:', error);
     process.exit(1);
@@ -50,6 +66,7 @@ const pool = new Pool({
   database: process.env.DB_NAME || 'oxxo_vouchers',
   password: process.env.DB_PASS || 'oxxo_secure_pass',
   port: 5432,
+  max: 15,
 });
 
 // Pool para UCRM (Conexión Secundaria)
@@ -59,6 +76,7 @@ const ucrmPool = new Pool({
   database: process.env.UCRM_DB_NAME,
   password: process.env.UCRM_DB_PASS,
   port: 5432,
+  max: 10,
 });
 
 // Inicializar DB
@@ -213,6 +231,19 @@ app.post('/orders/:id/generate', async (req, res) => {
           // Ocultar el botón de Imprimir ya que es solo una imagen para WhatsApp
           const printBtn = document.querySelector('.HostedVoucherButton');
           if (printBtn) printBtn.style.display = 'none';
+
+          // Ocultar elementos que no forman parte del voucher compartido.
+          const footerSelectors = [
+            '.PoweredByLink', '.PoweredBy',
+            '.TermsLinks', '.TermsLink',
+            '[class*="PoweredBy"]', '[class*="TermsLink"]',
+            'footer', '.Footer'
+          ];
+          footerSelectors.forEach((selector) => {
+            document.querySelectorAll(selector).forEach((element) => {
+              element.style.display = 'none';
+            });
+          });
 
           // Obtener la caja delimitadora del contenedor principal ancho que incluye "SIIP INTERNET" y sombra
           const targetArea = document.querySelector('.Chrome .flex-container.spacing-16.direction-column')
@@ -383,7 +414,7 @@ app.get('/stripe-metadata/:id', async (req, res) => {
     // Link: payment.payment_details_id = payment_stripe.payment_stripe_id
     // Solo para pagos con provider_id = 3 (Stripe)
     const query = `
-            SELECT ps.metadata
+            SELECT ps.metadata, ps.stripe_id
             FROM ucrm.payment p
             JOIN ucrm.payment_stripe ps ON ps.payment_stripe_id = p.payment_details_id
             WHERE p.payment_id = $1
@@ -391,7 +422,10 @@ app.get('/stripe-metadata/:id', async (req, res) => {
     const result = await ucrmPool.query(query, [id]);
 
     if (result.rows.length > 0) {
-      res.json({ metadata: result.rows[0].metadata });
+      res.json({
+        metadata: result.rows[0].metadata,
+        stripeId: result.rows[0].stripe_id
+      });
     } else {
       res.status(404).json({ error: 'Metadata not found or not a Stripe payment' });
     }
@@ -426,6 +460,35 @@ app.patch('/payments/:id/user', async (req, res) => {
     }
   } catch (err) {
     console.error('Error updating Payment User ID:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// 4.5. Actualizar Method ID en Payment (Direct SQL Patch)
+app.patch('/payments/:id/method', async (req, res) => {
+  const { id } = req.params;
+  const { methodId } = req.body;
+
+  if (!methodId) {
+    return res.status(400).json({ error: 'methodId is required' });
+  }
+
+  try {
+    const query = `
+            UPDATE ucrm.payment
+            SET method_id = $2
+            WHERE payment_id = $1
+            RETURNING payment_id, method_id
+        `;
+    const result = await ucrmPool.query(query, [id, methodId]);
+
+    if (result.rows.length > 0) {
+      res.json({ message: 'Method ID updated successfully', payment: result.rows[0] });
+    } else {
+      res.status(404).json({ error: 'Payment not found' });
+    }
+  } catch (err) {
+    console.error('Error updating Payment Method ID:', err);
     res.status(500).json({ error: 'Database error' });
   }
 });
