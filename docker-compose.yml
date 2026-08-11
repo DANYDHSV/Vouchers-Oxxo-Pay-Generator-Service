@@ -53,8 +53,8 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      MINIO_BROWSER_REDIRECT_URL: https://minio.siip.mx
-      MINIO_SERVER_URL: https://aws.siip.mx
+      MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL:-http://localhost:9003}
+      MINIO_SERVER_URL: ${MINIO_SERVER_URL:-http://localhost:9002}
     command: server /data --console-address ":9001"
     networks:
       - unms_internal

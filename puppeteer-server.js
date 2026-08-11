@@ -24,6 +24,7 @@ async function initBrowser() {
     console.log('Inicializando instancia global de Chromium...');
     globalBrowser = await puppeteer.launch({
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      protocolTimeout: 120000,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
